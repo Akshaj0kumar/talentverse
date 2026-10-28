@@ -1,3 +1,4 @@
+
 import {z} from 'zod';
 export class AiError extends Error{constructor(m,status=502){super(m);this.status=status;this.expose=true}}
 const analysisOut=z.object({
@@ -15,14 +16,26 @@ const roadmapOut=z.object({weeks:z.array(z.object({
 async function ask(prompt,out,ms=30000){
   const key=process.env.GEMINI_API_KEY;
   if(!key)throw new AiError('AI is not configured on the server.',503);
-  const model=process.env.GEMINI_MODEL||'gemini-2.5-flash';
-  let res;
-  try{res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',
-    headers:{'Content-Type':'application/json','x-goog-api-key':key},
-    body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json',temperature:0.4}}),
-    signal:AbortSignal.timeout(ms)})}
-  catch{throw new AiError('The AI service did not respond in time.')}
-  if(!res.ok)throw new AiError(`AI service error (${res.status}). Check GEMINI_API_KEY and GEMINI_MODEL.`);
+  const primary=process.env.GEMINI_MODEL||'gemini-2.5-flash';
+  const models=[primary,...(process.env.GEMINI_FALLBACK_MODEL&&process.env.GEMINI_FALLBACK_MODEL!==primary?[process.env.GEMINI_FALLBACK_MODEL]:[])];
+  let res,lastStatus;
+  for(const model of models){
+    for(let attempt=0;attempt<2;attempt++){
+      try{res=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,{method:'POST',
+        headers:{'Content-Type':'application/json','x-goog-api-key':key},
+        body:JSON.stringify({contents:[{parts:[{text:prompt}]}],generationConfig:{responseMimeType:'application/json',temperature:0.4}}),
+        signal:AbortSignal.timeout(ms)})}
+      catch{throw new AiError('The AI service did not respond in time.')}
+      if(res.ok)break;
+      const body=await res.text().catch(()=> '');
+      console.error('Gemini error',model,res.status,body.slice(0,500));
+      lastStatus=res.status;
+      if(![429,500,503].includes(res.status))break;
+      await new Promise(r=>setTimeout(r,1500));
+    }
+    if(res?.ok)break;
+  }
+  if(!res?.ok)throw new AiError(`AI service error (${lastStatus}). Check GEMINI_API_KEY and GEMINI_MODEL.`);
   const data=await res.json().catch(()=>null);
   try{return out.parse(JSON.parse(data?.candidates?.[0]?.content?.parts?.[0]?.text))}
   catch{throw new AiError('The AI returned an unexpected format. Try again.')}
